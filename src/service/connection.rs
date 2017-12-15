@@ -18,13 +18,13 @@ use wire_protocol::message::Message;
 use wire_protocol::header::Header;
 
 use super::bufstream::Stream;
-use super::service::ServiceEvent;
+use super::service::ServiceMessage;
 
 pub struct Connection {
     socket: TcpStream,
     token: Token,
     interest: Ready,
-    stream: Stream,
+    stream: Stream
 }
 
 impl Connection {
@@ -33,17 +33,17 @@ impl Connection {
             socket: socket,
             token: token,
             interest: Ready::readable() | Ready::hup(),
-            stream: Stream::new(),
+            stream: Stream::new()
         };
 
         Ok(conn)
     }
 
-    pub fn reader(&mut self, poll: &Poll, tx_out: &Sender<ServiceEvent>) -> io::Result<()> {
+    pub fn reader(&mut self, poll: &Poll, tx_out: &Sender<ServiceMessage>) -> io::Result<()> {
         self.interest.remove(Ready::readable());
 
         loop {
-            let mut buf = [0; 8 * 1024];
+            let mut buf = [0; 1024];
 
             match self.socket.read(&mut buf) {
                 Ok(size) => {
@@ -140,7 +140,7 @@ impl Connection {
         ).unwrap();
     }
 
-    pub fn send_message(&mut self, tx_out: &Sender<ServiceEvent>) -> io::Result<()> {
+    pub fn send_message(&mut self, tx_out: &Sender<ServiceMessage>) -> io::Result<()> {
         loop {
 
             if self.stream.reader.len() < mem::size_of::<Header>() {
@@ -169,7 +169,8 @@ impl Connection {
 
             self.stream.reader = self.stream.reader.split_off(position as usize);
 
-            let _ = tx_out.send(ServiceEvent::Message(self.token.into(), message));
+            //let _ = tx_out.send((self.token.into(), message));
+            let _ = tx_out.send(ServiceMessage::Message(self.token.into(), message));
         }
     }
 

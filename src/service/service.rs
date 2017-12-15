@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::io::ErrorKind::WouldBlock;
+use std::io::ErrorKind::{WouldBlock, ConnectionAborted};
 use std::cell::Cell;
+use std::sync::mpsc::TryRecvError;
+use std::error::Error;
 
 use queen_io::*;
 use queen_io::channel::{self, Receiver, Sender};
@@ -19,34 +21,28 @@ pub struct Service {
     events: Events,
     conns: HashMap<Token, Connection>,
     token_counter: Cell<usize>,
-    rx_in: Receiver<ServiceEvent>,
-    tx_out: Sender<ServiceEvent>,
+    rx_in: Receiver<ServiceMessage>,
+    tx_out: Sender<ServiceMessage>,
     socket: Option<TcpListener>,
     run: bool
 }
 
-#[derive(Debug)]
-pub enum ServiceEvent {
-    Command(Command),
-    Error(CommandError),
-    Message(usize, Message)
+pub enum ServiceMessage {
+    Message(usize, Message),
+    Command(Command)
 }
 
-#[derive(Debug)]
 pub enum Command {
-    Shutdown,
-    SetSocket(String),
-    NewConn(String)
-}
-
-#[derive(Debug)]
-pub enum CommandError {
-    SetSocket(io::Error),
-    NewConn(io::Error)
+    Listen { id: usize, addr: String },
+    LinkTo { id: usize, addr: String },
+    Shoutdown,
+    CloseConn { id: usize },
+    ListenReply { id: usize, addr: String, msg: String },
+    LinkToReply { id: usize, addr: String, msg: String }
 }
 
 impl Service {
-    pub fn new() -> io::Result<(Service, Sender<ServiceEvent>, Receiver<ServiceEvent>)> {
+    pub fn new() -> io::Result<(Service, Sender<ServiceMessage>, Receiver<ServiceMessage>)> {
         let (tx_in, rx_in) = channel::channel()?;
         let (tx_out, rx_out) = channel::channel()?;
 
@@ -74,59 +70,76 @@ impl Service {
     }
 
     fn channel_process(&mut self) -> io::Result<()> {
-        for event in self.rx_in.try_iter() {
-            match event {
-                ServiceEvent::Command(command) => {
-                    match command {
-                        Command::Shutdown => {
-                            self.run = false
-                        }
-                        Command::SetSocket(addr) => {
-                            let socket = match TcpListener::bind(addr) {
-                                Ok(socket) => socket,
-                                Err(err) => {
-                                    self.tx_out.send(ServiceEvent::Error(CommandError::SetSocket(err))).unwrap();
-
-                                    continue
-                                }
-                            };
-
-                            self.poll.register(&socket, SOCKET, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
-
-                            self.socket = Some(socket);
-                        }
-                        Command::NewConn(addr) => {
-                            let socket = match TcpStream::connect(addr) {
-                                Ok(socket) => socket,
-                                Err(err) => {
-                                    self.tx_out.send(ServiceEvent::Error(CommandError::NewConn(err))).unwrap();
-
-                                    continue
-                                }
-                            };
-
-                            let token = self.next_token();
-
-                            let conn = Connection::new(socket, token)?;
-                            conn.register_insterest(&self.poll);
-
-                            self.conns.insert(
-                                token,
-                                conn
-                            );
-                        }
+        loop {
+            let mess = match self.rx_in.try_recv() {
+                Ok(mess) => mess,
+                Err(err) => {
+                    if let TryRecvError::Empty = err {
+                        break;
                     }
+
+                    return Err(io::Error::new(ConnectionAborted, err).into())
                 }
-                ServiceEvent::Message(id, message) => {
+            };
+
+            match mess {
+                ServiceMessage::Message(id, message) => {
                     if let Some(conn) = self.conns.get_mut(&Token(id)) {
                         conn.recv_message(&self.poll, message)?;
                     }
                 }
-                _ => ()
+                ServiceMessage::Command(command) => {
+                    self.service_command(command)?;
+                }
             }
         }
 
         self.poll.reregister(&self.rx_in, CHANNEL, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+
+        Ok(())
+    }
+
+    fn service_command(&mut self, command: Command) -> io::Result<()> {
+        match command {
+            Command::Listen { id, addr } => {
+                let socket = match TcpListener::bind(addr.clone()) {
+                    Ok(socket) => socket,
+                    Err(err) => {
+                        let _= self.tx_out.send(ServiceMessage::Command(Command::ListenReply {id: id, addr: addr, msg: err.description().to_owned()}));
+                        return Ok(())
+                    }
+                };
+
+                self.poll.register(&socket, SOCKET, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+
+                self.socket = Some(socket);
+            }
+            Command::LinkTo { id, addr } => {
+                let socket = match TcpStream::connect(addr.clone()) {
+                    Ok(socket) => socket,
+                    Err(err) => {
+                        let _= self.tx_out.send(ServiceMessage::Command(Command::LinkToReply {id: id, addr: addr, msg: err.description().to_owned()}));
+                        return Ok(())
+                    }
+                };
+
+                let token = self.next_token();
+
+                let conn = Connection::new(socket, token)?;
+                conn.register_insterest(&self.poll);
+
+                self.conns.insert(token, conn);
+            }
+            Command::Shoutdown => {
+                self.run = false
+            }
+            Command::CloseConn { id } => {
+                self.remove_connent(Token(id));
+            }
+            _ => {
+                unimplemented!()
+            }
+        }
 
         Ok(())
     }

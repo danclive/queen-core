@@ -17,7 +17,7 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn new(request_id: i32, response_to: i32, op_code: OpCode, target: String, origin: String, content_type: String, body: Vec<u8>) -> Result<Message> {
+    pub fn new(request_id: i32, op_code: OpCode, target: String, origin: String, content_type: String, body: Vec<u8>) -> Message {
         let header_length = mem::size_of::<Header>();
         let target_length = target.len() + 1;
         let origin_length = origin.len() + 1;
@@ -26,15 +26,35 @@ impl Message {
 
         let total_length = header_length + target_length + origin_length + content_type_length + body_length;
 
-        let header = Header::new(total_length as i32, request_id, response_to, op_code);
+        let header = Header::new(total_length as i32, request_id, op_code);
 
-        Ok(Message {
+        Message {
             header: header,
             target: target,
             origin: origin,
             content_type: content_type,
             body: body
-        })
+        }
+    }
+
+    pub fn with_header(mut header: Header, target: String, origin: String, content_type: String, body: Vec<u8>) -> Message {
+        let header_length = mem::size_of::<Header>();
+        let target_length = target.len() + 1;
+        let origin_length = origin.len() + 1;
+        let content_type_length = content_type.len() + 1;
+        let body_length = body.len();
+
+        let total_length = header_length + target_length + origin_length + content_type_length + body_length;
+
+        header.message_length = total_length as i32;
+
+        Message {
+            header: header,
+            target: target,
+            origin: origin,
+            content_type: content_type,
+            body: body
+        }
     }
 
     pub fn get_opcode(&self) -> &OpCode {
@@ -43,6 +63,14 @@ impl Message {
 
     pub fn len(&self) -> usize {
         self.header.message_length as usize
+    }
+
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+
+    pub fn body(&self) -> &Vec<u8> {
+        &self.body
     }
 
     pub fn write<W: Write>(&self, buffer: &mut W) -> Result<()> {
