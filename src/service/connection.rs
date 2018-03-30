@@ -14,8 +14,7 @@ use queen_io::channel::Sender;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use wire_protocol::message::Message;
-use wire_protocol::header::Header;
+use wire_protocol::Message;
 
 use super::bufstream::Stream;
 use super::service::ServiceMessage;
@@ -143,12 +142,13 @@ impl Connection {
     pub fn send_message(&mut self, tx_out: &Sender<ServiceMessage>) -> io::Result<()> {
         loop {
 
-            if self.stream.reader.len() < mem::size_of::<Header>() {
+            if self.stream.reader.len() < mem::size_of::<u32>() {
                 return Ok(())
             }
 
             let message_length = {
-                Cursor::new(&self.stream.reader).read_i32::<LittleEndian>()? as usize
+                let mut cursor = Cursor::new(&self.stream.reader);
+                cursor.read_u32::<LittleEndian>()? as usize
             };
 
             if self.stream.reader.len() < message_length {
@@ -159,17 +159,13 @@ impl Connection {
 
                 let mut cursor = Cursor::new(&self.stream.reader);
 
-                let message = match Message::read(&mut cursor)? {
-                    Some(message) => message,
-                    None => return Ok(()),
-                };
+                let message = Message::read(&mut cursor)?;
 
                 (message, cursor.position())
             };
 
             self.stream.reader = self.stream.reader.split_off(position as usize);
 
-            //let _ = tx_out.send((self.token.into(), message));
             let _ = tx_out.send(ServiceMessage::Message(self.token.into(), message));
         }
     }

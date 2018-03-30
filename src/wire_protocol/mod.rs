@@ -1,3 +1,4 @@
-pub mod header;
-pub mod message;
+mod message;
 pub mod error;
+
+pub use self::message::{Message, OpCode};
