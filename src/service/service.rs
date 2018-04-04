@@ -2,12 +2,11 @@ use std::collections::HashMap;
 use std::io::ErrorKind::{WouldBlock, ConnectionAborted};
 use std::cell::Cell;
 use std::sync::mpsc::TryRecvError;
-use std::error::Error;
+use std::net::ToSocketAddrs;
 
 use queen_io::*;
 use queen_io::channel::{self, Receiver, Sender};
 use queen_io::tcp::TcpListener;
-use queen_io::tcp::TcpStream;
 
 use wire_protocol::Message;
 
@@ -23,7 +22,7 @@ pub struct Service {
     token_counter: Cell<usize>,
     rx_in: Receiver<ServiceMessage>,
     tx_out: Sender<ServiceMessage>,
-    socket: Option<TcpListener>,
+    socket: TcpListener,
     run: bool
 }
 
@@ -35,37 +34,17 @@ pub enum ServiceMessage {
 
 #[derive(Debug)]
 pub enum Command {
-    Listen {
-        id: usize,
-        addr: String
-    },
-    LinkTo {
-        id: usize,
-        addr: String
-    },
     Shoutdown,
     CloseConn {
         id: usize
-    },
-    ListenReply {
-        id: usize,
-        addr: String,
-        success: bool,
-        msg: String
-    },
-    LinkToReply {
-        id: usize,
-        token: usize,
-        addr: String,
-        success: bool,
-        msg: String
     }
 }
 
 impl Service {
-    pub fn new() -> io::Result<(Service, Sender<ServiceMessage>, Receiver<ServiceMessage>)> {
+    pub fn new<A: ToSocketAddrs>(addr: A) -> io::Result<(Service, Sender<ServiceMessage>, Receiver<ServiceMessage>)> {
         let (tx_in, rx_in) = channel::channel()?;
         let (tx_out, rx_out) = channel::channel()?;
+        let socket = TcpListener::bind(addr)?;
 
         let service = Service {
             poll: Poll::new()?,
@@ -74,32 +53,15 @@ impl Service {
             token_counter: Cell::new(8),
             rx_in: rx_in,
             tx_out: tx_out,
-            socket: None,
+            socket: socket,
             run: true
 
         };
 
         service.poll.register(&service.rx_in, CHANNEL, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
+        service.poll.register(&service.socket, SOCKET, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
 
         Ok((service, tx_in, rx_out))
-    }
-
-    pub fn with_channel(tx_out: Sender<ServiceMessage>, rx_in: Receiver<ServiceMessage>) -> io::Result<Service> {
-        let service = Service {
-            poll: Poll::new()?,
-            events: Events::with_capacity(256),
-            conns: HashMap::with_capacity(128),
-            token_counter: Cell::new(8),
-            rx_in: rx_in,
-            tx_out: tx_out,
-            socket: None,
-            run: true
-
-        };
-
-        service.poll.register(&service.rx_in, CHANNEL, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
-
-        Ok(service)
     }
 
     fn next_token(&self) -> Token {
@@ -140,87 +102,11 @@ impl Service {
 
     fn service_command(&mut self, command: Command) -> io::Result<()> {
         match command {
-            Command::Listen { id, addr } => {
-                let socket = match TcpListener::bind(addr.clone()) {
-                    Ok(socket) => socket,
-                    Err(err) => {
-                        let _= self.tx_out.send(
-                            ServiceMessage::Command(
-                                Command::ListenReply {
-                                    id: id,
-                                    addr: addr,
-                                    success: false,
-                                    msg: err.description().to_owned()
-                                }
-                            )
-                        );
-
-                        return Ok(())
-                    }
-                };
-
-                self.poll.register(&socket, SOCKET, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
-
-                self.socket = Some(socket);
-
-                let _ = self.tx_out.send(
-                    ServiceMessage::Command(
-                        Command::ListenReply {
-                            id: id,
-                            addr: addr,
-                            success: true,
-                            msg: String::default()
-                        }
-                    )
-                );
-            }
-            Command::LinkTo { id, addr } => {
-                let socket = match TcpStream::connect(addr.clone()) {
-                    Ok(socket) => socket,
-                    Err(err) => {
-                        let _= self.tx_out.send(
-                            ServiceMessage::Command(
-                                Command::LinkToReply {
-                                    id: id,
-                                    token: 0,
-                                    addr: addr,
-                                    success: false,
-                                    msg: err.description().to_owned()
-                                }
-                            )
-                        );
-
-                        return Ok(())
-                    }
-                };
-
-                let token = self.next_token();
-
-                let conn = Connection::new(socket, token)?;
-                conn.register_insterest(&self.poll);
-
-                self.conns.insert(token, conn);
-
-                let _ = self.tx_out.send(
-                    ServiceMessage::Command(
-                        Command::LinkToReply {
-                            id: id,
-                            token: token.into(),
-                            addr: addr,
-                            success: true,
-                            msg: String::default()
-                        }
-                    )
-                );
-            }
             Command::Shoutdown => {
                 self.run = false
             }
             Command::CloseConn { id } => {
                 self.remove_connent(Token(id));
-            }
-            _ => {
-                unimplemented!()
             }
         }
 
@@ -230,13 +116,6 @@ impl Service {
     fn connect_process(&mut self, event: Event, token: Token) -> io::Result<()> {
         if event.readiness().is_hup() || event.readiness().is_error() {
             self.remove_connent(token);
-
-            let _ = self.tx_out.send(
-                ServiceMessage::Command(
-                    Command::CloseConn { id: token.into() }
-                )
-            );
-
             return Ok(())
         }
 
@@ -256,12 +135,6 @@ impl Service {
 
         if close {
             self.remove_connent(token);
-
-            let _ = self.tx_out.send(
-                ServiceMessage::Command(
-                    Command::CloseConn { id: token.into() }
-                )
-            );
         }
 
         Ok(())
@@ -270,41 +143,44 @@ impl Service {
     fn remove_connent(&mut self, token: Token) {
         if let Some(conn) = self.conns.remove(&token) {
             conn.deregister(&self.poll).unwrap();
+
+            let _ = self.tx_out.send(
+                ServiceMessage::Command(
+                    Command::CloseConn { id: token.into() }
+                )
+            );
         }
     }
 
     fn dispatch(&mut self, event: Event) -> io::Result<()> {
         match event.token() {
             SOCKET => {
-                match self.socket {
-                    Some(ref socket) => {
-                        loop {
-                            let socket = match socket.accept().map(|s| s.0) {
-                                Ok(socket) => socket,
-                                Err(err) => {
-                                    if let WouldBlock = err.kind() {
-                                        break;
-                                    } else {
-                                        return Err(err)
-                                    }
-                                }
-                            };
-
-                            let token = self.next_token();
-
-                            let conn = Connection::new(socket, token)?;
-                            conn.register_insterest(&self.poll);
-
-                            self.conns.insert(
-                                token,
-                                conn
-                            );
+                loop {
+                    let socket = match self.socket.accept().map(|s| s.0) {
+                        Ok(socket) => socket,
+                        Err(err) => {
+                            if let WouldBlock = err.kind() {
+                                break;
+                            } else {
+                                return Err(err)
+                            }
                         }
+                    };
 
-                        self.poll.reregister(socket, SOCKET, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
-                    }
-                    None => ()
+                    socket.set_nodelay(true)?;
+
+                    let token = self.next_token();
+
+                    let conn = Connection::new(socket, token)?;
+                    conn.register_insterest(&self.poll);
+
+                    self.conns.insert(
+                        token,
+                        conn
+                    );
                 }
+
+                self.poll.reregister(&self.socket, SOCKET, Ready::readable(), PollOpt::edge() | PollOpt::oneshot())?;
 
                 Ok(())
             }
