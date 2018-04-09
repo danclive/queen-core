@@ -1,7 +1,6 @@
 use std::io;
 use std::io::{Read, Write};
 use std::io::ErrorKind::WouldBlock;
-use std::io::Cursor;
 use std::mem;
 
 use queen_io::tcp::TcpStream;
@@ -11,8 +10,6 @@ use queen_io::Ready;
 use queen_io::PollOpt;
 use queen_io::Evented;
 use queen_io::channel::Sender;
-
-use byteorder::{LittleEndian, ReadBytesExt};
 
 use wire_protocol::Message;
 
@@ -49,7 +46,7 @@ impl Connection {
                     if size == 0 {
                         return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "ConnectionAborted"))
                     } else {
-                        self.stream.reader.extend_from_slice(&buf[0..size]);
+                        self.stream.reader.write(&buf[0..size])?;
                     }
                 }
                 Err(err) => {
@@ -85,15 +82,18 @@ impl Connection {
         self.interest.remove(Ready::writable());
 
         loop {
-            match self.socket.write(&self.stream.writer) {
+            let mut buf = [0; 1024];
+
+            let pos = self.stream.writer.seek(&mut buf)?;
+
+            match self.socket.write(&buf[0..pos]) {
                 Ok(size) => {
                     if size == 0 {
                         return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "ConnectionAborted"))
                     } else {
-                        if size < self.stream.writer.len() {
-                            self.stream.writer = self.stream.writer.split_off(size);
-                        } else {
-                            self.stream.writer.clear();
+                        self.stream.writer.set_position(size);
+
+                        if self.stream.writer.is_empty() {
                             break;
                         }
                     }
@@ -141,32 +141,29 @@ impl Connection {
 
     pub fn send_message(&mut self, tx_out: &Sender<ServiceMessage>) -> io::Result<()> {
         loop {
-
             if self.stream.reader.len() < mem::size_of::<u32>() {
                 return Ok(())
             }
 
             let message_length = {
-                let mut cursor = Cursor::new(&self.stream.reader);
-                cursor.read_u32::<LittleEndian>()? as usize
+                let mut buf = [0; 4];
+                self.stream.reader.seek(&mut buf)?;
+
+                (
+                    ((buf[0] as u32) << 0) |
+                    ((buf[1] as u32) << 8) |
+                    ((buf[2] as u32) << 16) |
+                    ((buf[3] as u32) << 24)
+                ) as usize
             };
 
             if self.stream.reader.len() < message_length {
                 return Ok(())
             }
 
-            let (message, position) = {
+            let message = Message::read(&mut self.stream.reader)?;
 
-                let mut cursor = Cursor::new(&self.stream.reader);
-
-                let message = Message::read(&mut cursor)?;
-
-                (message, cursor.position())
-            };
-
-            self.stream.reader = self.stream.reader.split_off(position as usize);
-
-            let _ = tx_out.send(ServiceMessage::Message(self.token.into(), message));
+            tx_out.send(ServiceMessage::Message(self.token.into(), message)).unwrap();
         }
     }
 

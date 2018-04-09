@@ -1,14 +1,13 @@
-use std::io::Read;
-use std::io::Write;
-use std::io::Result as IoResult;
+use std::io::{self, Read, Write};
+use std::collections::VecDeque;
 use std::cmp;
-use std::mem;
 
-const DEFAULT_CAPACITY: usize = 16 * 1024;
+const DEFAULT_CAPACITY: usize = 8 * 1024;
 
+#[derive(Debug)]
 pub struct Stream {
-    pub reader: Vec<u8>,
-    pub writer: Vec<u8>,
+    pub reader: RingBuffer,
+    pub writer: RingBuffer,
 }
 
 impl Stream {
@@ -18,34 +17,96 @@ impl Stream {
 
     pub fn with_capacity(capacity: usize) -> Stream {
         Stream {
-            reader: Vec::with_capacity(capacity),
-            writer: Vec::with_capacity(capacity)
+            reader: RingBuffer::with_capacity(capacity),
+            writer: RingBuffer::with_capacity(capacity)
         }
     }
 }
 
-impl Read for Stream {
-    #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        let amt = cmp::min(buf.len(), self.reader.len());
-        
-        let reader = mem::replace(&mut self.reader, Vec::new());
-        let (a, b) = reader.split_at(amt);
-        buf[..amt].copy_from_slice(a);
-        self.reader = b.to_vec();
-        
+#[derive(Clone, Debug)]
+pub struct RingBuffer {
+    inner: VecDeque<u8>
+}
+
+impl RingBuffer {
+    pub fn new() -> Self {
+        RingBuffer {
+            inner: VecDeque::new()
+        }
+    }
+
+    pub fn with_capacity(n: usize) -> Self {
+        RingBuffer {
+            inner: VecDeque::with_capacity(n)
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn pop(&mut self) -> Option<u8> {
+        self.inner.pop_front()
+    }
+
+    pub fn push(&mut self, value: u8) {
+        self.inner.push_back(value)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.inner.clear()
+    }
+
+    pub fn set_position(&mut self, pos: usize) {
+        // for _ in 0..pos {
+        //     self.pop();
+        // }
+        self.inner.drain(0..pos);
+    }
+
+    pub fn seek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let amt = cmp::min(buf.len(), self.inner.len());
+
+        for (i, value) in buf[0..amt].iter_mut().enumerate() {
+            let v = self.inner.get(i).unwrap();
+            *value = *v
+        }
+
         Ok(amt)
     }
 }
 
-impl Write for Stream {
-    #[inline]
-    fn write(&mut self, data: &[u8]) -> IoResult<usize> {
-        self.writer.write(data)
+impl Write for RingBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for i in buf.iter() {
+            self.push(*i);
+        }
+
+        Ok(buf.len())
     }
 
-    fn flush(&mut self) -> IoResult<()> {
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
+impl Read for RingBuffer {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let amt = cmp::min(buf.len(), self.inner.len());
+
+        for i in buf[0..amt].iter_mut() {
+            let v = self.pop().unwrap();
+            *i = v;
+        }
+
+        Ok(amt)
+    }
+}
